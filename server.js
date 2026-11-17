@@ -9,6 +9,8 @@ const PORT = process.env.PORT || 3000;
 const DATA = path.join(__dirname, 'data');
 const SCHEDULE_FILE = path.join(__dirname, 'schedule.json');
 const CACHE_FILE = path.join(__dirname, 'bypass-cache.json');
+const KEY_FILE = path.join(__dirname, 'bypass-key.txt');       // bypass.vip premium key (optional)
+const CAPTCHA_FILE = path.join(__dirname, 'captcha-key.txt');  // 2captcha.com key
 fs.mkdirSync(DATA, { recursive: true });
 
 const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
@@ -16,9 +18,20 @@ const nextDay = (d) => new Date(Date.parse(d + 'T00:00:00Z') + 864e5).toISOStrin
 const localDate = (t = new Date()) => `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
 
 // ---- bypass.vip ----
-const BYPASS_API = 'https://api.bypass.vip/bypass?url=';
-const OK_TTL = 24 * 60 * 60 * 1000;   // trust a good result for a day
-const FAIL_TTL = 10 * 60 * 1000;      // retry a failure after ten minutes
+const PREMIUM_BYPASS = 'https://api.bypass.vip/premium/bypass';
+const PREMIUM_REFRESH = 'https://api.bypass.vip/premium/refresh';
+const FREE_BYPASS = 'https://api.bypass.vip/bypass';
+const OK_TTL = 24 * 60 * 60 * 1000; // trust a good result for a day
+const FAIL_TTL = 10 * 60 * 1000;    // retry a failure after ten minutes
+
+// The captcha bypass.vip puts in front of its free endpoint (invisible hCaptcha on their homepage).
+const HCAPTCHA_SITEKEY = '69a3b3f1-9884-4e4f-b381-2843c64d955d';
+const HCAPTCHA_PAGEURL = 'https://bypass.vip/';
+const CAPTCHA_MAX_PER_RUN = Number(process.env.CAPTCHA_MAX_PER_RUN || 30);
+
+// Keys from the environment or a file next to this one (re-read each call so you can drop them in live).
+const readKey = () => process.env.BYPASS_VIP_KEY || (fs.existsSync(KEY_FILE) ? fs.readFileSync(KEY_FILE, 'utf8').trim() : '');
+const readCaptchaKey = () => process.env.CAPTCHA_API_KEY || (fs.existsSync(CAPTCHA_FILE) ? fs.readFileSync(CAPTCHA_FILE, 'utf8').trim() : '');
 
 // Hosts worth sending to the API. Anything else is already the real file.
 const LOCKERS = ['linkvertise.com','linkvertise.net','link-to.net','up-to-down.net','file-upload.net','lootlinks.com','loot-links.com','lootlink.org','lootlabs.gg','work.ink','workink.net','mboost.me','bst.gg','booo.st','rekonise.com','social-unlock.com','sub2unlock.com','sub2unlock.net','sub2get.com','sub4unlock.io','unlocknow.net','ytsubme.com','cuty.io','cety.io','boost.ink','adfoc.us','paster.so','paster.gg','mendationforc.info','socialwolvez.com','subfinal.com'];
@@ -32,31 +45,84 @@ try { cache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')); } catch {}
 let cacheTimer;
 const saveCache = () => { clearTimeout(cacheTimer); cacheTimer = setTimeout(() => { try { fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2)); } catch {} }, 500); };
 
-// Returns the real destination, or null if the bypass failed.
-async function bypassLink(url, { refresh = false } = {}) {
-  if (!isLocker(url)) return url;
-  const hit = cache[url];
-  if (!refresh && hit && Date.now() - hit.at < (hit.result ? OK_TTL : FAIL_TTL)) return hit.result;
-  let result = null;
-  try {
-    const r = await fetch(BYPASS_API + encodeURIComponent(url), {
-      headers: { 'user-agent': 'Mozilla/5.0', accept: 'application/json' },
-      signal: AbortSignal.timeout(20_000),
-    });
-    const j = await r.json().catch(() => null);
-    if (j && j.status === 'success' && typeof j.result === 'string' && /^https?:\/\//.test(j.result)) result = j.result;
-  } catch {}
-  cache[url] = { result, at: Date.now() };
-  saveCache();
-  return result;
+// ---- captcha solving ----
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let solves = 0; // per-run counter, reset by scrapeDay
+
+async function solveHcaptcha() {
+  const key = readCaptchaKey();
+  if (!key) return { token: null, error: 'no-captcha-key' };
+  if (solves >= CAPTCHA_MAX_PER_RUN) return { token: null, error: 'captcha-budget' };
+  solves++;
+
+  const params = new URLSearchParams({ key, method: 'hcaptcha', sitekey: HCAPTCHA_SITEKEY, pageurl: HCAPTCHA_PAGEURL, invisible: '1', json: '1' });
+  const submit = await (await fetch(`https://2captcha.com/in.php?${params}`, { signal: AbortSignal.timeout(20_000) })).json().catch(() => null);
+  if (!submit || submit.status !== 1) return { token: null, error: `2captcha: ${submit?.request || 'submit failed'}` };
+
+  for (let i = 0; i < 30; i++) {
+    await sleep(5000);
+    const poll = new URLSearchParams({ key, action: 'get', id: submit.request, json: '1' });
+    const j = await (await fetch(`https://2captcha.com/res.php?${poll}`, { signal: AbortSignal.timeout(20_000) })).json().catch(() => null);
+    if (j?.status === 1) return { token: j.request, error: null };
+    if (j && j.request !== 'CAPCHA_NOT_READY') return { token: null, error: `2captcha: ${j.request}` };
+  }
+  return { token: null, error: '2captcha: timeout' };
 }
 
-// Small pool so a full day doesn't fire dozens of requests at once.
-async function bypassAll(urls, limit = 4) {
+// ---- bypassing ----
+async function freeBypass(url) {
+  const { token, error } = await solveHcaptcha();
+  if (!token) return { result: null, error };
+  const r = await fetch(`${FREE_BYPASS}?url=${encodeURIComponent(url)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'user-agent': 'Mozilla/5.0', accept: 'application/json' },
+    body: JSON.stringify({ url, hcaptchaToken: token }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const j = await r.json().catch(() => null);
+  if (j && j.status === 'success' && typeof j.result === 'string' && /^https?:\/\//i.test(j.result)) return { result: j.result, error: null };
+  return { result: null, error: j?.message || `free API HTTP ${r.status}` };
+}
+
+async function premiumBypass(url, refresh) {
+  const key = readKey();
+  const endpoint = refresh ? PREMIUM_REFRESH : PREMIUM_BYPASS;
+  const r = await fetch(`${endpoint}?url=${encodeURIComponent(url)}`, {
+    headers: { 'x-api-key': key, accept: 'application/json', 'user-agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(20_000),
+  });
+  const j = await r.json().catch(() => null);
+  if (j && j.status === 'success' && typeof j.result === 'string' && /^https?:\/\//i.test(j.result)) return { result: j.result, error: null };
+  return { result: null, error: j?.message || `premium API HTTP ${r.status}` };
+}
+
+// Returns { result } on success or { error } on failure. Never throws.
+async function bypassLink(url, { refresh = false } = {}) {
+  if (!isLocker(url)) return { result: url, error: null };
+
+  const hit = cache[url];
+  if (!refresh && hit && Date.now() - hit.at < (hit.result ? OK_TTL : FAIL_TTL)) return { result: hit.result, error: hit.error || null };
+
+  let result = null, error = null;
+  try {
+    if (readKey()) ({ result, error } = await premiumBypass(url, refresh));
+    else if (readCaptchaKey()) ({ result, error } = await freeBypass(url));
+    else error = 'no-key';
+  } catch (e) {
+    error = e.message;
+  }
+
+  cache[url] = { result, error, at: Date.now() };
+  saveCache();
+  return { result, error };
+}
+
+// Small pool so a full day doesn't fire dozens of requests at once (and so 2captcha isn't flooded).
+async function bypassAll(urls, limit = 2) {
   const out = new Array(urls.length).fill(null);
   let i = 0;
   await Promise.all(Array.from({ length: Math.min(limit, urls.length) }, async () => {
-    while (i < urls.length) { const idx = i++; out[idx] = await bypassLink(urls[idx]); }
+    while (i < urls.length) { const idx = i++; out[idx] = (await bypassLink(urls[idx])).result; }
   }));
   return out;
 }
@@ -107,6 +173,7 @@ async function scrapeDay(date) {
   await Promise.all(rows.map(async (row) => { row.redirects_to = await Promise.all(row.links.map(resolveRedirect)); }));
 
   // Bypass whatever is actually a locker (raw href or its redirect target), once per unique URL.
+  solves = 0;
   const targets = new Map();
   for (const row of rows) row.links.forEach((l, i) => {
     const t = isLocker(l) ? l : (isLocker(row.redirects_to[i]) ? row.redirects_to[i] : null);
@@ -169,8 +236,9 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/bypass') {
       const target = u.searchParams.get('url');
       if (!/^https?:\/\//.test(target || '')) return send(res, 400, { error: 'url must be http(s)' });
-      const result = await bypassLink(target, { refresh: u.searchParams.has('refresh') });
-      return send(res, 200, { url: target, result });
+      solves = 0;
+      const { result, error } = await bypassLink(target, { refresh: u.searchParams.has('refresh') });
+      return send(res, 200, { url: target, result, error });
     }
     if (u.pathname === '/api/saved') {
       const d = u.searchParams.get('date');
@@ -204,6 +272,7 @@ server.on('error', (e) => {
 });
 // 127.0.0.1 only: the UI has no login, so don't expose it to the local network.
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`Scout scraper running at ${APP_URL}  (close this window to stop it)`);
+  const mode = readKey() ? 'premium key' : readCaptchaKey() ? 'free API + 2captcha' : 'no credentials (locker links only)';
+  console.log(`Scout scraper running at ${APP_URL}  (close this window to stop it)  [${mode}]`);
   openBrowser();
 });
