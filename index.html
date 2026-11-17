@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scout Scraper</title>
+<style>
+  :root {
+    --bg:#f4f5f7; --panel:#ffffff; --fg:#14161a; --muted:#6b7280; --line:#e4e6eb; --soft:#f0f2f5;
+    --accent:#4f46e5; --accent-fg:#fff; --ok:#16a34a; --err:#dc2626; --shadow:0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+  }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg:#0e0f12; --panel:#17191e; --fg:#e9eaee; --muted:#9097a3; --line:#262931; --soft:#1e2127;
+    --accent:#818cf8; --accent-fg:#0e0f12; --ok:#4ade80; --err:#f87171; --shadow:none;
+  } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+  a { color:inherit; }
+  main { max-width:1200px; margin:0 auto; padding:28px 16px 48px; }
+
+  header { display:flex; align-items:baseline; gap:12px; margin-bottom:20px; flex-wrap:wrap; }
+  header h1 { font-size:22px; letter-spacing:-.01em; margin:0; }
+  header span { color:var(--muted); }
+
+  .panels { display:grid; grid-template-columns:1fr; gap:14px; margin-bottom:24px; }
+  @media (min-width:900px) { .panels { grid-template-columns:3fr 2fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; box-shadow:var(--shadow); }
+  .panel h2 { font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; margin:0 0 12px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .sep { color:var(--muted); padding:0 4px; }
+  .note { color:var(--muted); font-size:12px; margin:10px 0 0; min-height:18px; }
+  .note.err { color:var(--err); } .note.ok { color:var(--ok); }
+
+  input, select, button { font:inherit; height:36px; padding:0 12px; border-radius:8px; border:1px solid var(--line); background:var(--soft); color:var(--fg); }
+  input:focus-visible, select:focus-visible, button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  button { cursor:pointer; font-weight:500; }
+  button.primary { background:var(--accent); color:var(--accent-fg); border-color:transparent; }
+  button:disabled { opacity:.55; cursor:default; }
+  button.primary:disabled { cursor:progress; }
+
+  .switch { display:inline-flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
+  .switch input { appearance:none; width:38px; height:22px; padding:0; border-radius:11px; background:var(--line); border:0; position:relative; cursor:pointer; transition:background .15s; }
+  .switch input::after { content:""; position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%; background:#fff; transition:transform .15s; box-shadow:0 1px 2px rgba(0,0,0,.3); }
+  .switch input:checked { background:var(--accent); }
+  .switch input:checked::after { transform:translateX(16px); }
+
+  .results-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+  .results-head h2 { font-size:18px; margin:0; }
+  .results-head span { color:var(--muted); font-size:13px; }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(270px, 1fr)); gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; box-shadow:var(--shadow); display:flex; flex-direction:column; }
+  .thumb { aspect-ratio:16/9; background:var(--soft); display:block; width:100%; object-fit:cover; cursor:zoom-in; transition:opacity .15s; }
+  .thumb:hover { opacity:.9; }
+  .nothumb { aspect-ratio:16/9; display:grid; place-items:center; color:var(--muted); background:var(--soft); }
+  .body { padding:12px 14px 14px; display:flex; flex-direction:column; gap:10px; }
+  .title { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .title strong { font-size:15px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .title a { font-size:12px; color:var(--muted); text-decoration:none; font-variant-numeric:tabular-nums; flex-shrink:0; }
+  .title a:hover { color:var(--accent); }
+  .link { display:grid; grid-template-columns:1fr auto; gap:2px 6px; align-items:center; }
+  .link label { grid-column:1 / -1; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .link a { font-size:13px; color:var(--accent); text-decoration:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .link a:hover { text-decoration:underline; }
+  .link .none { font-size:13px; color:var(--muted); }
+  .copy { height:26px; padding:0 8px; font-size:12px; background:transparent; }
+  .copy:hover { background:var(--soft); }
+
+  .empty { text-align:center; color:var(--muted); padding:56px 16px; border:1px dashed var(--line); border-radius:12px; }
+
+  .toast { position:fixed; bottom:20px; left:50%; transform:translate(-50%, 20px); opacity:0; background:var(--fg); color:var(--bg); padding:8px 14px; border-radius:8px; font-size:13px; transition:.2s; pointer-events:none; }
+  .toast.show { opacity:1; transform:translate(-50%, 0); }
+
+  dialog { padding:0; border:0; margin:0; width:100vw; height:100vh; max-width:none; max-height:none; background:transparent; overflow:hidden; display:none; align-items:center; justify-content:center; touch-action:none; }
+  dialog[open] { display:flex; }
+  dialog::backdrop { background:rgba(0,0,0,.88); }
+  dialog img { max-width:95vw; max-height:95vh; border-radius:8px; cursor:grab; user-select:none; -webkit-user-drag:none; }
+  dialog .hint { position:fixed; bottom:14px; left:50%; transform:translateX(-50%); color:#ddd; background:rgba(0,0,0,.6); padding:5px 12px; border-radius:8px; font-size:12px; pointer-events:none; white-space:nowrap; max-width:calc(100vw - 32px); overflow:hidden; text-overflow:ellipsis; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Scout Scraper</h1>
+    <span>scouted-today.pk</span>
+  </header>
+
+  <div class="panels">
+    <section class="panel">
+      <h2>Get posts</h2>
+      <div class="row">
+        <input type="date" id="date" aria-label="Date">
+        <button class="primary" id="go">Get posts</button>
+        <span class="sep">or</span>
+        <select id="saved" aria-label="Load a saved day"><option value="">Load saved day…</option></select>
+        <button id="csv" disabled>Download CSV</button>
+      </div>
+      <p class="note" id="status"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Auto-run daily</h2>
+      <div class="row">
+        <label class="switch"><input type="checkbox" id="enabled"> Enabled</label>
+        <span class="sep">at</span>
+        <input type="time" id="time" aria-label="Time">
+        <button id="saveSched">Save</button>
+      </div>
+      <p class="note" id="schedInfo"></p>
+    </section>
+  </div>
+
+  <div class="results-head">
+    <h2 id="resultsTitle">No day loaded</h2>
+    <span id="resultsMeta"></span>
+  </div>
+  <div id="rows"><div class="empty">Pick a date and click <b>Get posts</b>, or load a saved day.</div></div>
+</main>
+
+<div class="toast" id="toast"></div>
+<dialog id="light"><img id="lightImg" alt="" draggable="false"><div class="hint">Scroll to zoom · drag to move · double-click to zoom/reset · click or Esc to close</div></dialog>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+const decode = (html) => { const t = document.createElement('textarea'); t.innerHTML = html.replace(/<[^>]*>?/g, ''); return t.value; };
+let current = null;
+
+const d = new Date();
+$('date').value = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+
+function note(id, text, kind = '') { $(id).textContent = text; $(id).className = 'note ' + kind; }
+
+let toastTimer;
+function toast(text) { $('toast').textContent = text; $('toast').classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').classList.remove('show'), 1400); }
+
+const linkRow = (label, urls, failText) => `
+  <div class="link"><label>${label}</label>${urls.length ? urls.map((l) => l
+    ? `<a href="${esc(l)}" target="_blank" rel="noreferrer" title="${esc(l)}">${esc(l.replace(/^https?:\/\//, ''))}</a><button class="copy" data-copy="${esc(l)}">Copy</button>`
+    : `<span class="none">${failText}</span><span></span>`).join('') : '<span class="none">none</span><span></span>'}</div>`;
+
+function render(result) {
+  current = result;
+  $('csv').disabled = !result.posts.length;
+  $('resultsTitle').textContent = new Date(result.date + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  $('resultsMeta').textContent = `${result.count} post${result.count === 1 ? '' : 's'} · scraped ${new Date(result.scraped_at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}`;
+  $('rows').className = result.posts.length ? 'grid' : '';
+  $('rows').innerHTML = result.posts.length ? result.posts.map((p) => `
+    <article class="card">
+      ${p.thumbnail ? `<img class="thumb" src="${esc(p.thumbnail)}" data-full="${esc(p.full_image || p.thumbnail)}" loading="lazy" alt="Thumbnail for ${esc(decode(p.title))}">` : '<div class="nothumb">No thumbnail</div>'}
+      <div class="body">
+        <div class="title"><strong title="${esc(decode(p.title))}">${esc(decode(p.title))} <span style="color:var(--muted);font-weight:400;font-size:13px">${esc(p.date.slice(11, 16))}</span></strong>
+          <a href="${esc(p.post_url)}" target="_blank" rel="noreferrer" title="Open post">#${p.id}</a></div>
+        ${linkRow('Post link', p.links, '')}
+        ${p.redirects_to ? linkRow('Redirects to', p.redirects_to, "couldn't resolve") : ''}
+      </div>
+    </article>`).join('') : '<div class="empty">No posts on this day.</div>';
+}
+
+async function refreshSaved() {
+  const days = await api('/api/saved');
+  $('saved').innerHTML = '<option value="">Load saved day…</option>' + days.map((x) => `<option>${x}</option>`).join('');
+}
+
+$('go').onclick = async () => {
+  $('go').disabled = true; $('go').textContent = 'Scraping…'; note('status', '');
+  try { const r = await api('/api/scrape?date=' + $('date').value); render(r); note('status', `Saved ${r.count} posts for ${r.date}.`, 'ok'); refreshSaved(); }
+  catch (e) { note('status', 'Error: ' + e.message, 'err'); }
+  $('go').disabled = false; $('go').textContent = 'Get posts';
+};
+
+$('saved').onchange = async (e) => {
+  if (!e.target.value) return;
+  try { render(await api('/api/saved?date=' + e.target.value)); note('status', ''); }
+  catch (err) { note('status', 'Error: ' + err.message, 'err'); }
+};
+
+$('csv').onclick = () => {
+  const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
+  const lines = [['id','date','title','thumbnail','links','redirects_to'].join(','),
+    ...current.posts.map((p) => [p.id, p.date, decode(p.title), p.thumbnail || '', p.links.join(' '), (p.redirects_to || []).join(' ')].map(q).join(','))];
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
+  a.download = `scouted-${current.date}.csv`; a.click();
+};
+
+function showSched(s, prefix = '') {
+  $('enabled').checked = s.enabled; $('time').value = s.time;
+  const status = s.enabled ? `Runs every day at ${s.time}.` : 'Off.';
+  note('schedInfo', [prefix, status, s.last_result && `Last: ${s.last_result}`].filter(Boolean).join(' '), prefix ? 'ok' : '');
+}
+$('saveSched').onclick = async () => {
+  try { showSched(await api('/api/schedule', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: $('enabled').checked, time: $('time').value }) }), 'Saved.'); }
+  catch (e) { note('schedInfo', 'Error: ' + e.message, 'err'); }
+};
+
+// Image popup with zoom/pan. Click (without dragging) or Esc closes; Esc is native to <dialog>.
+const light = $('light'), img = $('lightImg');
+let z = { s: 1, x: 0, y: 0 }, drag = null, moved = false;
+const apply = () => { img.style.transform = `translate(${z.x}px, ${z.y}px) scale(${z.s})`; img.style.cursor = drag ? 'grabbing' : 'grab'; };
+// Zoom to scale s while keeping screen point (px, py) fixed under the cursor.
+function zoomTo(s, px, py) {
+  s = Math.min(10, Math.max(1, s));
+  const r = img.getBoundingClientRect(), cx = r.left + r.width / 2 - z.x, cy = r.top + r.height / 2 - z.y;
+  z.x = px - cx - (s / z.s) * (px - cx - z.x);
+  z.y = py - cy - (s / z.s) * (py - cy - z.y);
+  z.s = s;
+  if (s === 1) z.x = z.y = 0;
+  apply();
+}
+$('rows').onclick = async (e) => {
+  const t = e.target;
+  if (t.dataset.copy) {
+    try { await navigator.clipboard.writeText(t.dataset.copy); toast('Copied'); } catch { toast("Couldn't copy"); }
+    return;
+  }
+  if (!t.dataset.full) return;
+  z = { s: 1, x: 0, y: 0 }; apply();
+  img.src = t.dataset.full; light.showModal();
+};
+light.addEventListener('wheel', (e) => { e.preventDefault(); zoomTo(z.s * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY); }, { passive: false });
+light.ondblclick = (e) => zoomTo(z.s > 1 ? 1 : 2.5, e.clientX, e.clientY);
+light.onpointerdown = (e) => { drag = { x: e.clientX - z.x, y: e.clientY - z.y, sx: e.clientX, sy: e.clientY }; moved = false; light.setPointerCapture(e.pointerId); };
+light.onpointermove = (e) => {
+  if (!drag) return;
+  if (Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) > 4) moved = true;
+  if (moved && z.s > 1) { z.x = e.clientX - drag.x; z.y = e.clientY - drag.y; apply(); }
+};
+light.onpointerup = () => { drag = null; apply(); };
+// Delay close so a double-click can cancel it.
+let closeTimer;
+light.onclick = (e) => { if (moved) return; clearTimeout(closeTimer); if (e.detail === 1) closeTimer = setTimeout(() => light.close(), 250); };
+light.addEventListener('dblclick', () => clearTimeout(closeTimer));
+document.addEventListener('keydown', (e) => {
+  if (!light.open) return;
+  const cx = innerWidth / 2, cy = innerHeight / 2;
+  if (e.key === '+' || e.key === '=') zoomTo(z.s * 1.25, cx, cy);
+  if (e.key === '-') zoomTo(z.s / 1.25, cx, cy);
+  if (e.key === '0') zoomTo(1, cx, cy);
+});
+
+api('/api/schedule').then((s) => showSched(s));
+refreshSaved();
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+  "name": "scout-scrape",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scrapes a day's posts from scouted-today.pk, with a web UI and a daily auto-run.",
+  "scripts": { "start": "node server.js --open" },
+  "engines": { "node": ">=18" }
+}

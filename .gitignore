@@ -1,0 +1,4 @@
+data/
+schedule.json
+.claude/
+node_modules/
