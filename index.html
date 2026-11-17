@@ -243,16 +243,20 @@ $('rows').onclick = async (e) => {
     btn.disabled = true;
     const win = window.open('', '_blank'); // claim the tab now, or the popup blocker eats it
     try {
-      const { result } = await api('/api/bypass?url=' + encodeURIComponent(btn.dataset.bypass));
-      if (!result) throw new Error('failed');
-      if (sib?.dataset.copy) sib.dataset.copy = result;
-      btn.outerHTML = `<a class="gofile" href="${esc(result)}" target="_blank" rel="noreferrer" title="${esc(result)}">Go to file</a>`;
-      if (win) win.location = result; else window.open(result, '_blank');
+      const res = await api('/api/bypass?url=' + encodeURIComponent(btn.dataset.bypass));
+      if (!res.result) throw new Error(res.error || 'failed');
+      if (sib?.dataset.copy) sib.dataset.copy = res.result;
+      btn.outerHTML = `<a class="gofile" href="${esc(res.result)}" target="_blank" rel="noreferrer" title="${esc(res.result)}">Go to file</a>`;
+      if (win) win.location = res.result; else window.open(res.result, '_blank');
       toast('Bypassed');
-    } catch {
+    } catch (err) {
       if (win) win.location = btn.dataset.bypass; else window.open(btn.dataset.bypass, '_blank');
       btn.disabled = false;
-      toast('Bypass failed — opened the locker');
+      toast({
+        'no-key': 'No bypass credentials — add captcha-key.txt',
+        'no-captcha-key': 'No 2captcha key set',
+        'captcha-budget': 'Captcha budget for this run is used up',
+      }[err.message] || 'Bypass failed — opened the locker');
     }
     return;
   }
