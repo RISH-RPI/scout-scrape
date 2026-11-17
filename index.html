@@ -66,6 +66,13 @@
   .copy { height:26px; padding:0 8px; font-size:12px; background:transparent; }
   .copy:hover { background:var(--soft); }
 
+  .gofile { height:26px; padding:0 10px; font-size:12px; font-weight:600; border-radius:6px; background:var(--accent); color:var(--accent-fg); border:0; display:inline-flex; align-items:center; white-space:nowrap; }
+  .link a.gofile { color:var(--accent-fg); text-decoration:none; }
+  .gofile:hover { filter:brightness(1.08); }
+  .gofile.pending { background:var(--soft); color:var(--fg); border:1px solid var(--line); font-weight:500; }
+  .gofile.pending:hover { background:var(--panel); }
+  .gofile:disabled { opacity:.6; cursor:progress; }
+
   .empty { text-align:center; color:var(--muted); padding:56px 16px; border:1px dashed var(--line); border-radius:12px; }
 
   .toast { position:fixed; bottom:20px; left:50%; transform:translate(-50%, 20px); opacity:0; background:var(--fg); color:var(--bg); padding:8px 14px; border-radius:8px; font-size:13px; transition:.2s; pointer-events:none; }
@@ -146,6 +153,15 @@ const linkRow = (label, urls, failText) => `
     ? `<a href="${esc(l)}" target="_blank" rel="noreferrer" title="${esc(l)}">${esc(l.replace(/^https?:\/\//, ''))}</a><button class="copy" data-copy="${esc(l)}">Copy</button>`
     : `<span class="none">${failText}</span><span></span>`).join('') : '<span class="none">none</span><span></span>'}</div>`;
 
+// Resolved destination as a button; falls back to a "resolve me" button when the bypass hasn't run or failed.
+const fileRow = (links, bypassed) => `
+  <div class="link"><label>File</label>${links.length ? links.map((l, i) => {
+    const dest = bypassed?.[i] || null;
+    return dest
+      ? `<a class="gofile" href="${esc(dest)}" target="_blank" rel="noreferrer" title="${esc(dest)}">Go to file</a><button class="copy" data-copy="${esc(dest)}">Copy</button>`
+      : `<button class="gofile pending" data-bypass="${esc(l)}" title="Bypass this link">Go to file</button><button class="copy" data-copy="${esc(l)}">Copy</button>`;
+  }).join('') : '<span class="none">none</span><span></span>'}</div>`;
+
 function render(result) {
   current = result;
   $('csv').disabled = !result.posts.length;
@@ -158,7 +174,8 @@ function render(result) {
       <div class="body">
         <div class="title"><strong title="${esc(decode(p.title))}">${esc(decode(p.title))} <span style="color:var(--muted);font-weight:400;font-size:13px">${esc(p.date.slice(11, 16))}</span></strong>
           <a href="${esc(p.post_url)}" target="_blank" rel="noreferrer" title="Open post">#${p.id}</a></div>
-        ${linkRow('Post link', p.links, '')}
+        ${fileRow(p.links, p.bypassed)}
+        ${linkRow('Locker link', p.links, '')}
         ${p.redirects_to ? linkRow('Redirects to', p.redirects_to, "couldn't resolve") : ''}
       </div>
     </article>`).join('') : '<div class="empty">No posts on this day.</div>';
@@ -184,8 +201,8 @@ $('saved').onchange = async (e) => {
 
 $('csv').onclick = () => {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
-  const lines = [['id','date','title','thumbnail','links','redirects_to'].join(','),
-    ...current.posts.map((p) => [p.id, p.date, decode(p.title), p.thumbnail || '', p.links.join(' '), (p.redirects_to || []).join(' ')].map(q).join(','))];
+  const lines = [['id','date','title','thumbnail','links','redirects_to','bypassed'].join(','),
+    ...current.posts.map((p) => [p.id, p.date, decode(p.title), p.thumbnail || '', p.links.join(' '), (p.redirects_to || []).join(' '), (p.bypassed || []).join(' ')].map(q).join(','))];
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
   a.download = `scouted-${current.date}.csv`; a.click();
@@ -221,6 +238,24 @@ $('rows').onclick = async (e) => {
     try { await navigator.clipboard.writeText(t.dataset.copy); toast('Copied'); } catch { toast("Couldn't copy"); }
     return;
   }
+  if (t.dataset.bypass) {
+    const btn = t, sib = btn.nextElementSibling;
+    btn.disabled = true;
+    const win = window.open('', '_blank'); // claim the tab now, or the popup blocker eats it
+    try {
+      const { result } = await api('/api/bypass?url=' + encodeURIComponent(btn.dataset.bypass));
+      if (!result) throw new Error('failed');
+      if (sib?.dataset.copy) sib.dataset.copy = result;
+      btn.outerHTML = `<a class="gofile" href="${esc(result)}" target="_blank" rel="noreferrer" title="${esc(result)}">Go to file</a>`;
+      if (win) win.location = result; else window.open(result, '_blank');
+      toast('Bypassed');
+    } catch {
+      if (win) win.location = btn.dataset.bypass; else window.open(btn.dataset.bypass, '_blank');
+      btn.disabled = false;
+      toast('Bypass failed — opened the locker');
+    }
+    return;
+  }
   if (!t.dataset.full) return;
   z = { s: 1, x: 0, y: 0 }; apply();
   img.src = t.dataset.full; light.showModal();
@@ -242,7 +277,7 @@ document.addEventListener('keydown', (e) => {
   if (!light.open) return;
   const cx = innerWidth / 2, cy = innerHeight / 2;
   if (e.key === '+' || e.key === '=') zoomTo(z.s * 1.25, cx, cy);
-  if (e.key === '-') zoomTo(z.s / 1.25, cx, cy);
+  if (e.key === '-' || e.key === '_') zoomTo(z.s / 1.25, cx, cy);
   if (e.key === '0') zoomTo(1, cx, cy);
 });
 
