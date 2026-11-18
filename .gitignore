@@ -2,3 +2,4 @@ data/
 schedule.json
 .claude/
 node_modules/
+bypass-key.txt

@@ -1,136 +1,91 @@
 // Zero-dependency scraper for scouted-today.pk (WordPress REST API) + web UI + daily auto-run.
+// Bypass is bypass.vip premium ONLY, and only runs when you click a file button.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const { Readable } = require('stream');
 
 const SITE = 'https://scouted-today.pk';
 const PORT = process.env.PORT || 3000;
 const DATA = path.join(__dirname, 'data');
 const SCHEDULE_FILE = path.join(__dirname, 'schedule.json');
 const CACHE_FILE = path.join(__dirname, 'bypass-cache.json');
-const KEY_FILE = path.join(__dirname, 'bypass-key.txt');       // bypass.vip premium key (optional)
-const CAPTCHA_FILE = path.join(__dirname, 'captcha-key.txt');  // 2captcha.com key
+const KEY_FILE = path.join(__dirname, 'bypass-key.txt'); // bypass.vip premium key
 fs.mkdirSync(DATA, { recursive: true });
 
 const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
 const nextDay = (d) => new Date(Date.parse(d + 'T00:00:00Z') + 864e5).toISOString().slice(0, 10);
 const localDate = (t = new Date()) => `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
 
-// ---- bypass.vip ----
+// ---- bypass.vip premium ----
 const PREMIUM_BYPASS = 'https://api.bypass.vip/premium/bypass';
 const PREMIUM_REFRESH = 'https://api.bypass.vip/premium/refresh';
-const FREE_BYPASS = 'https://api.bypass.vip/bypass';
-const OK_TTL = 24 * 60 * 60 * 1000; // trust a good result for a day
-const FAIL_TTL = 10 * 60 * 1000;    // retry a failure after ten minutes
+const OK_TTL = 24 * 60 * 60 * 1000; // a good result is reused for a day, so a repeat click costs nothing
+const FAIL_TTL = 10 * 60 * 1000;    // a failure is retried after ten minutes
 
-// The captcha bypass.vip puts in front of its free endpoint (invisible hCaptcha on their homepage).
-const HCAPTCHA_SITEKEY = '69a3b3f1-9884-4e4f-b381-2843c64d955d';
-const HCAPTCHA_PAGEURL = 'https://bypass.vip/';
-const CAPTCHA_MAX_PER_RUN = Number(process.env.CAPTCHA_MAX_PER_RUN || 30);
-
-// Keys from the environment or a file next to this one (re-read each call so you can drop them in live).
+// Read live every call, so you can drop the key in without restarting.
 const readKey = () => process.env.BYPASS_VIP_KEY || (fs.existsSync(KEY_FILE) ? fs.readFileSync(KEY_FILE, 'utf8').trim() : '');
-const readCaptchaKey = () => process.env.CAPTCHA_API_KEY || (fs.existsSync(CAPTCHA_FILE) ? fs.readFileSync(CAPTCHA_FILE, 'utf8').trim() : '');
+const hasKey = () => readKey().length > 0;
 
 // Hosts worth sending to the API. Anything else is already the real file.
-const LOCKERS = ['linkvertise.com','linkvertise.net','link-to.net','up-to-down.net','file-upload.net','lootlinks.com','loot-links.com','lootlink.org','lootlabs.gg','work.ink','workink.net','mboost.me','bst.gg','booo.st','rekonise.com','social-unlock.com','sub2unlock.com','sub2unlock.net','sub2get.com','sub4unlock.io','unlocknow.net','ytsubme.com','cuty.io','cety.io','boost.ink','adfoc.us','paster.so','paster.gg','mendationforc.info','socialwolvez.com','subfinal.com'];
+const LOCKERS = ['linkvertise.com','linkvertise.net','linkvertise.link','link-hub.net','link-hub.com','link-to.net','up-to-down.net','file-upload.net','lootlinks.com','loot-links.com','lootlink.org','lootlabs.gg','work.ink','workink.net','mboost.me','bst.gg','booo.st','rekonise.com','social-unlock.com','sub2unlock.com','sub2unlock.net','sub2get.com','sub4unlock.io','unlocknow.net','ytsubme.com','cuty.io','cety.io','boost.ink','adfoc.us','paster.so','paster.gg','mendationforc.info','socialwolvez.com','subfinal.com'];
 const isLocker = (u) => {
   try { const h = new URL(u).hostname.toLowerCase().replace(/^www\./, ''); return LOCKERS.some((d) => h === d || h.endsWith('.' + d)); }
   catch { return false; }
 };
+
+// A result only counts if the whole string is a URL, and if it isn't bypass.vip's own page.
+const isUrl = (s) => typeof s === 'string' && /^https?:\/\/[^\s]+$/i.test(s.trim());
+const isOwnPage = (s) => { try { return /(^|\.)bypass\.vip$/i.test(new URL(s).hostname); } catch { return false; } };
 
 let cache = {};
 try { cache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8')); } catch {}
 let cacheTimer;
 const saveCache = () => { clearTimeout(cacheTimer); cacheTimer = setTimeout(() => { try { fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2)); } catch {} }, 500); };
 
-// ---- captcha solving ----
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-let solves = 0; // per-run counter, reset by scrapeDay
-
-async function solveHcaptcha() {
-  const key = readCaptchaKey();
-  if (!key) return { token: null, error: 'no-captcha-key' };
-  if (solves >= CAPTCHA_MAX_PER_RUN) return { token: null, error: 'captcha-budget' };
-  solves++;
-
-  const params = new URLSearchParams({ key, method: 'hcaptcha', sitekey: HCAPTCHA_SITEKEY, pageurl: HCAPTCHA_PAGEURL, invisible: '1', json: '1' });
-  const submit = await (await fetch(`https://2captcha.com/in.php?${params}`, { signal: AbortSignal.timeout(20_000) })).json().catch(() => null);
-  if (!submit || submit.status !== 1) return { token: null, error: `2captcha: ${submit?.request || 'submit failed'}` };
-
-  for (let i = 0; i < 30; i++) {
-    await sleep(5000);
-    const poll = new URLSearchParams({ key, action: 'get', id: submit.request, json: '1' });
-    const j = await (await fetch(`https://2captcha.com/res.php?${poll}`, { signal: AbortSignal.timeout(20_000) })).json().catch(() => null);
-    if (j?.status === 1) return { token: j.request, error: null };
-    if (j && j.request !== 'CAPCHA_NOT_READY') return { token: null, error: `2captcha: ${j.request}` };
-  }
-  return { token: null, error: '2captcha: timeout' };
-}
-
-// ---- bypassing ----
-async function freeBypass(url) {
-  const { token, error } = await solveHcaptcha();
-  if (!token) return { result: null, error };
-  const r = await fetch(`${FREE_BYPASS}?url=${encodeURIComponent(url)}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'user-agent': 'Mozilla/5.0', accept: 'application/json' },
-    body: JSON.stringify({ url, hcaptchaToken: token }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const j = await r.json().catch(() => null);
-  if (j && j.status === 'success' && typeof j.result === 'string' && /^https?:\/\//i.test(j.result)) return { result: j.result, error: null };
-  return { result: null, error: j?.message || `free API HTTP ${r.status}` };
-}
+// Every upstream response is logged so the console shows what really came back.
+const trace = (tag, status, raw) => console.log(`[bypass:${tag}]`, status, String(raw || '').replace(/\s+/g, ' ').slice(0, 300));
 
 async function premiumBypass(url, refresh) {
   const key = readKey();
+  if (!key) return { result: null, error: 'no-key' };
   const endpoint = refresh ? PREMIUM_REFRESH : PREMIUM_BYPASS;
   const r = await fetch(`${endpoint}?url=${encodeURIComponent(url)}`, {
     headers: { 'x-api-key': key, accept: 'application/json', 'user-agent': 'Mozilla/5.0' },
-    signal: AbortSignal.timeout(20_000),
+    signal: AbortSignal.timeout(25_000),
   });
-  const j = await r.json().catch(() => null);
-  if (j && j.status === 'success' && typeof j.result === 'string' && /^https?:\/\//i.test(j.result)) return { result: j.result, error: null };
-  return { result: null, error: j?.message || `premium API HTTP ${r.status}` };
+  const raw = await r.text();
+  trace(refresh ? 'refresh' : 'premium', r.status, raw);
+  let j = null;
+  try { j = JSON.parse(raw); } catch {}
+  const out = j && typeof j.result === 'string' ? j.result.trim() : null;
+  if (j && (j.status === 'success' || j.success === true) && isUrl(out) && !isOwnPage(out)) return { result: out, error: null };
+  return { result: null, error: j?.message || j?.error || `premium API HTTP ${r.status}` };
 }
 
 // Returns { result } on success or { error } on failure. Never throws.
 async function bypassLink(url, { refresh = false } = {}) {
   if (!isLocker(url)) return { result: url, error: null };
+  if (!hasKey()) return { result: null, error: 'no-key' };
 
   const hit = cache[url];
   if (!refresh && hit && Date.now() - hit.at < (hit.result ? OK_TTL : FAIL_TTL)) return { result: hit.result, error: hit.error || null };
 
   let result = null, error = null;
-  try {
-    if (readKey()) ({ result, error } = await premiumBypass(url, refresh));
-    else if (readCaptchaKey()) ({ result, error } = await freeBypass(url));
-    else error = 'no-key';
-  } catch (e) {
-    error = e.message;
-  }
+  try { ({ result, error } = await premiumBypass(url, refresh)); }
+  catch (e) { error = e.name === 'TimeoutError' ? 'timed out' : e.message; }
 
   cache[url] = { result, error, at: Date.now() };
   saveCache();
   return { result, error };
 }
 
-// Small pool so a full day doesn't fire dozens of requests at once (and so 2captcha isn't flooded).
-async function bypassAll(urls, limit = 2) {
-  const out = new Array(urls.length).fill(null);
-  let i = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, urls.length) }, async () => {
-    while (i < urls.length) { const idx = i++; out[idx] = (await bypassLink(urls[idx])).result; }
-  }));
-  return out;
-}
-
 // Pull out every outbound href from the post body (normally one locker link per post).
 const extractLinks = (html) => [...html.matchAll(/href="([^"]+)"/g)].map((m) => m[1].replace(/&amp;/g, '&'));
 
 // Follow plain HTTP redirects (30x Location headers) only; stops at the first page that isn't a redirect.
+// This costs no credits and reveals the real locker (e.g. link-hub.net) when the href is a wrapper.
 async function resolveRedirect(url) {
   try {
     for (let hop = 0; hop < 5; hop++) {
@@ -159,6 +114,7 @@ function toRow(p) {
 }
 
 // Dates are in the site's own timezone (WP interprets after/before that way).
+// No bypassing here: posts come back fast and nothing is charged until you click.
 async function scrapeDay(date) {
   const rows = [];
   for (let page = 1; ; page++) {
@@ -169,30 +125,60 @@ async function scrapeDay(date) {
     if (page >= Number(r.headers.get('x-wp-totalpages') || 1)) break;
   }
 
-  // Resolve redirects first: the real locker is sometimes one hop away from the href in the post.
+  // Redirect resolution only — free, and it points at the real locker.
   await Promise.all(rows.map(async (row) => { row.redirects_to = await Promise.all(row.links.map(resolveRedirect)); }));
-
-  // Bypass whatever is actually a locker (raw href or its redirect target), once per unique URL.
-  solves = 0;
-  const targets = new Map();
-  for (const row of rows) row.links.forEach((l, i) => {
-    const t = isLocker(l) ? l : (isLocker(row.redirects_to[i]) ? row.redirects_to[i] : null);
-    if (t) targets.set(t, null);
-  });
-  const keys = [...targets.keys()];
-  const values = await bypassAll(keys);
-  keys.forEach((k, i) => targets.set(k, values[i]));
-
-  rows.forEach((row) => {
-    row.bypassed = row.links.map((l, i) => {
-      const t = isLocker(l) ? l : (isLocker(row.redirects_to[i]) ? row.redirects_to[i] : null);
-      return t ? targets.get(t) : l;
-    });
-  });
 
   const result = { date, scraped_at: new Date().toISOString(), count: rows.length, posts: rows };
   fs.writeFileSync(path.join(DATA, `${date}.json`), JSON.stringify(result, null, 2));
   return result;
+}
+
+// ---- downloading ----
+// Strip anything awkward from a filename we hand back to the OS.
+const safeName = (s) => String(s || '').replace(/[\\/:*?"<>|\x00-\x1f]+/g, '_').replace(/^[.\s_]+/, '').replace(/\s+/g, ' ').trim().slice(0, 120);
+
+// Best-effort name: upstream header first, then the URL's last path segment, then a generic name.
+function filenameFor(url, headerName, type) {
+  const fromHeader = safeName(headerName);
+  if (fromHeader) return fromHeader;
+  let base = '';
+  try { base = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || ''); } catch {}
+  base = safeName(base);
+  if (base && base.includes('.')) return base;
+  const ext = { 'application/pdf': '.pdf', 'application/zip': '.zip', 'application/x-7z-compressed': '.7z', 'application/x-rar-compressed': '.rar', 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'video/mp4': '.mp4', 'audio/mpeg': '.mp3' }[(type || '').split(';')[0].trim().toLowerCase()] || '';
+  if (base) return base + (ext || '.html');
+  return 'download' + ext;
+}
+
+// Streams the resolved target to the browser as an attachment. Never buffers the whole file.
+async function sendDownload(res, target) {
+  let r;
+  try {
+    r = await fetch(target, {
+      headers: { 'user-agent': 'Mozilla/5.0', accept: '*/*' },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(120_000),
+    });
+  } catch (e) {
+    return send(res, 502, { error: 'fetch failed: ' + (e.name === 'TimeoutError' ? 'timed out' : e.message) });
+  }
+  if (!r.ok || !r.body) return send(res, 502, { error: `upstream HTTP ${r.status}` });
+
+  const type = r.headers.get('content-type') || 'application/octet-stream';
+  const cd = r.headers.get('content-disposition') || '';
+  const headerName = (/filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd) || [])[1];
+  const name = filenameFor(r.url || target, headerName, type);
+
+  res.writeHead(200, {
+    'content-type': type,
+    'content-disposition': `attachment; filename="${name.replace(/[^\x20-\x7e]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+    'cache-control': 'no-store',
+    'x-download-name': name,
+  });
+  const stream = Readable.fromWeb(r.body);
+  stream.on('error', () => res.destroy());
+  res.on('close', () => stream.destroy());
+  stream.pipe(res);
 }
 
 // ---- auto-run ----
@@ -234,15 +220,29 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await scrapeDay(d));
     }
     if (u.pathname === '/api/bypass') {
-      const target = u.searchParams.get('url');
-      if (!/^https?:\/\//.test(target || '')) return send(res, 400, { error: 'url must be http(s)' });
-      solves = 0;
+      const target = (u.searchParams.get('url') || '').trim();
+      if (!isUrl(target)) return send(res, 400, { error: 'url must be http(s)' });
+      if (!hasKey()) return send(res, 400, { error: 'no-key' });
       const { result, error } = await bypassLink(target, { refresh: u.searchParams.has('refresh') });
       return send(res, 200, { url: target, result, error });
     }
+    if (u.pathname === '/api/download') {
+      const target = (u.searchParams.get('url') || '').trim();
+      if (!isUrl(target)) return send(res, 400, { error: 'url must be http(s)' });
+      if (isOwnPage(target)) return send(res, 400, { error: 'that is bypass.vip, not a file' });
+      return sendDownload(res, target);
+    }
+    if (u.pathname === '/api/key') {
+      // Lets the UI say whether a key is present, without ever exposing it.
+      return send(res, 200, { has_key: hasKey(), source: process.env.BYPASS_VIP_KEY ? 'env' : (fs.existsSync(KEY_FILE) ? 'file' : null) });
+    }
     if (u.pathname === '/api/saved') {
       const d = u.searchParams.get('date');
-      if (isDate(d)) return send(res, 200, JSON.parse(fs.readFileSync(path.join(DATA, `${d}.json`), 'utf8')));
+      if (isDate(d)) {
+        const f = path.join(DATA, `${d}.json`);
+        if (!fs.existsSync(f)) return send(res, 404, { error: 'no saved day' });
+        return send(res, 200, JSON.parse(fs.readFileSync(f, 'utf8')));
+      }
       return send(res, 200, fs.readdirSync(DATA).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, 10)).sort().reverse());
     }
     if (u.pathname === '/api/schedule') {
@@ -258,7 +258,8 @@ const server = http.createServer(async (req, res) => {
     }
     send(res, 404, { error: 'not found' });
   } catch (e) {
-    send(res, 500, { error: e.message });
+    if (!res.headersSent) send(res, 500, { error: e.message });
+    else res.destroy();
   }
 });
 
@@ -272,7 +273,7 @@ server.on('error', (e) => {
 });
 // 127.0.0.1 only: the UI has no login, so don't expose it to the local network.
 server.listen(PORT, '127.0.0.1', () => {
-  const mode = readKey() ? 'premium key' : readCaptchaKey() ? 'free API + 2captcha' : 'no credentials (locker links only)';
-  console.log(`Scout scraper running at ${APP_URL}  (close this window to stop it)  [${mode}]`);
+  console.log(`Scout scraper running at ${APP_URL}  (close this window to stop it)`);
+  console.log(hasKey() ? '[bypass] premium key loaded — resolving on click only' : '[bypass] NO premium key — drop one in bypass-key.txt');
   openBrowser();
 });
