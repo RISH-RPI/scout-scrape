@@ -21,6 +21,7 @@
   header { display:flex; align-items:baseline; gap:12px; margin-bottom:20px; flex-wrap:wrap; }
   header h1 { font-size:22px; letter-spacing:-.01em; margin:0; }
   header span { color:var(--muted); }
+  header .build { font-size:11px; color:var(--muted); border:1px solid var(--line); border-radius:20px; padding:1px 8px; }
 
   .panels { display:grid; grid-template-columns:1fr; gap:14px; margin-bottom:24px; }
   @media (min-width:900px) { .panels { grid-template-columns:3fr 2fr; } }
@@ -83,8 +84,10 @@
 
   .empty { text-align:center; color:var(--muted); padding:56px 16px; border:1px dashed var(--line); border-radius:12px; }
 
-  .toast { position:fixed; bottom:20px; left:50%; transform:translate(-50%, 20px); opacity:0; background:var(--fg); color:var(--bg); padding:8px 14px; border-radius:8px; font-size:13px; transition:.2s; pointer-events:none; max-width:90vw; }
+  .toast { position:fixed; bottom:20px; left:50%; transform:translate(-50%, 20px); opacity:0; background:var(--fg); color:var(--bg); padding:8px 14px; border-radius:8px; font-size:13px; transition:.2s; pointer-events:none; max-width:90vw; display:flex; align-items:center; gap:10px; }
   .toast.show { opacity:1; transform:translate(-50%, 0); }
+  .toast.has-action { pointer-events:auto; }
+  .toast button { height:24px; padding:0 10px; font-size:12px; font-weight:600; border:0; border-radius:6px; background:var(--accent); color:var(--accent-fg); }
 
   dialog { padding:0; border:0; margin:0; width:100vw; height:100vh; max-width:none; max-height:none; background:transparent; overflow:hidden; display:none; align-items:center; justify-content:center; touch-action:none; }
   dialog[open] { display:flex; }
@@ -98,6 +101,7 @@
   <header>
     <h1>Scout Scraper</h1>
     <span>scouted-today.pk</span>
+    <span class="build" id="build">?</span>
   </header>
 
   <div class="panels">
@@ -154,28 +158,51 @@ async function api(url, opts) {
 function note(id, text, kind = '') { $(id).textContent = text; $(id).className = 'note ' + kind; }
 
 let toastTimer;
-function toast(text) { $('toast').textContent = text; $('toast').classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').classList.remove('show'), 1800); }
+function toast(text, action) {
+  const el = $('toast');
+  el.textContent = text;
+  if (action) {
+    const b = document.createElement('button');
+    b.textContent = action.label;
+    b.onclick = action.fn;
+    el.appendChild(b);
+    el.classList.add('has-action');
+  } else {
+    el.classList.remove('has-action');
+  }
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.classList.remove('show'); el.classList.remove('has-action'); }, action ? 8000 : 4000);
+}
 
-// Triggers the server-side attachment stream without navigating away from the page.
-function startDownload(url) {
+const reveal = (folder) => api('/api/reveal?folder=' + encodeURIComponent(folder)).catch(() => {});
+
+// Saves a streamed attachment without navigating away from the page.
+function startDownload(url, name) {
   const a = document.createElement('a');
-  a.href = '/api/download?url=' + encodeURIComponent(url);
+  a.href = '/api/download?url=' + encodeURIComponent(url) + (name ? '&name=' + encodeURIComponent(name) : '');
   a.rel = 'noreferrer';
   document.body.appendChild(a);
   a.click();
   a.remove();
 }
 
-// Go to file resolves the link; Download does the same if needed and then saves the file.
-// Rows loaded from an older saved day may already carry a resolved destination.
-const fileRow = (links, bypassed) => `
+// Hosts that mean "still locked". A stored destination matching this needs re-resolving.
+const LOCKER_RE = /(^|\.)(linkvertise\.(com|net|link)|link-hub\.(net|com)|link-to\.net|up-to-down\.net|bypass\.vip)$/i;
+const isLockerUrl = (u) => { try { return LOCKER_RE.test(new URL(u).hostname); } catch { return false; } };
+
+// Go to file resolves the link; Download saves the whole album, named after the post.
+// The resolve target prefers the redirect target, since the raw href is often a site wrapper.
+const fileRow = (links, bypassed, redirects, title) => `
   <div class="link"><label>File</label>${links.length ? links.map((l, i) => {
-    const dest = bypassed?.[i] || null;
+    const raw = bypassed?.[i] || null;
+    const dest = raw && !isLockerUrl(raw) ? raw : null;
+    const target = redirects?.[i] && isLockerUrl(redirects[i]) ? redirects[i] : l;
     return (dest
       ? `<a class="gofile" href="${esc(dest)}" target="_blank" rel="noreferrer" title="${esc(dest)}">Go to file</a>`
-      : `<button class="gofile pending" data-bypass="${esc(l)}" title="Resolve this link — shift-click to force a fresh lookup">Go to file</button>`)
-      + `<button class="dl" data-dl="${esc(l)}"${dest ? ` data-dest="${esc(dest)}"` : ''} title="Download this file">Download</button>`
-      + `<button class="copy" data-copy="${esc(dest || l)}">Copy</button>`;
+      : `<button class="gofile pending" data-bypass="${esc(target)}" title="Resolve this link — shift-click to force a fresh lookup">Go to file</button>`)
+      + `<button class="dl" data-dl="${esc(target)}" data-title="${esc(title)}"${dest ? ` data-dest="${esc(dest)}"` : ''} title="Save this album as ${esc(title)}.zip">Download</button>`
+      + `<button class="copy" data-copy="${esc(dest || target)}">Copy</button>`;
   }).join('') : '<span class="none">none</span><span></span><span></span>'}</div>`;
 
 // The outbound post link: the redirect target when we have one, otherwise the raw locker href.
@@ -203,7 +230,7 @@ function render(result) {
       <div class="body">
         <div class="title"><strong title="${esc(decode(p.title))}">${esc(decode(p.title))} <span style="color:var(--muted);font-weight:400;font-size:13px">${esc(p.date.slice(11, 16))}</span></strong>
           <a href="${esc(p.post_url)}" target="_blank" rel="noreferrer" title="Open post">#${p.id}</a></div>
-        ${fileRow(p.links, p.bypassed)}
+        ${fileRow(p.links, p.bypassed, p.redirects_to, decode(p.title))}
         ${postLinkRow(p.links, p.redirects_to)}
         ${siteRow(p.post_url)}
       </div>
@@ -240,7 +267,7 @@ $('csv').onclick = () => {
 function showSched(s, prefix = '') {
   $('enabled').checked = s.enabled; $('time').value = s.time;
   const status = s.enabled ? `Runs every day at ${s.time}.` : 'Off.';
-  note('schedInfo', [prefix, status, s.last_result && `Last: ${s.last_result}`].join(' '), prefix ? 'ok' : '');
+  note('schedInfo', [prefix, status, s.last_result && `Last: ${s.last_result}`].filter(Boolean).join(' '), prefix ? 'ok' : '');
 }
 $('saveSched').onclick = async () => {
   try { showSched(await api('/api/schedule', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: $('enabled').checked, time: $('time').value }) }), 'Saved.'); }
@@ -264,7 +291,10 @@ function zoomTo(s, px, py) {
 
 const ERRORS = {
   'no-key': 'No premium key — put one in bypass-key.txt',
-  'timed out': 'Bypass timed out',
+  'key rejected': 'Premium key rejected — check it is current',
+  'still-locked': 'Still locked — the key worked but nothing came back',
+  'no-media': 'Nothing downloadable found on that page',
+  'timed out': 'Timed out',
 };
 
 $('rows').onclick = async (e) => {
@@ -277,25 +307,36 @@ $('rows').onclick = async (e) => {
     window.open(t.dataset.open, '_blank', 'noreferrer');
     return;
   }
-  // Download: use the known destination, or resolve first and then save.
+  // Download: resolve if needed, then save the album as a zip named after the post.
   if (t.dataset.dl) {
-    if (t.dataset.dest) { startDownload(t.dataset.dest); return; }
     const gobtn = t.previousElementSibling, cp = t.nextElementSibling;
     t.disabled = true;
     const lbl = t.textContent;
-    t.textContent = 'Resolving…';
+    t.textContent = 'Saving…';
     try {
-      const res = await api('/api/bypass?url=' + encodeURIComponent(t.dataset.dl));
-      if (!res.result) throw new Error(res.error || 'failed');
-      t.dataset.dest = res.result;
-      if (cp?.dataset.copy) cp.dataset.copy = res.result;
-      if (gobtn?.dataset.bypass) {
-        gobtn.outerHTML = `<a class="gofile" href="${esc(res.result)}" target="_blank" rel="noreferrer" title="${esc(res.result)}">Go to file</a>`;
+      let dest = t.dataset.dest;
+      if (!dest) {
+        const res = await api('/api/bypass?url=' + encodeURIComponent(t.dataset.dl));
+        if (!res.result) throw new Error(res.error || 'failed');
+        dest = res.result;
+        t.dataset.dest = dest;
+        if (cp?.dataset.copy) cp.dataset.copy = dest;
+        if (gobtn?.dataset.bypass) {
+          gobtn.outerHTML = `<a class="gofile" href="${esc(dest)}" target="_blank" rel="noreferrer" title="${esc(dest)}">Go to file</a>`;
+        }
       }
-      startDownload(res.result);
-      toast('Downloading');
+      const grab = await api('/api/grab?url=' + encodeURIComponent(dest) + '&title=' + encodeURIComponent(t.dataset.title || ''));
+      if (grab.zip) {
+        startDownload(grab.zip, grab.name);
+        toast(`Downloading ${grab.name}`);
+      } else if (grab.saved.length) {
+        const extra = grab.failed.length ? `, ${grab.failed.length} failed` : '';
+        toast(`Saved ${grab.saved.length} file${grab.saved.length === 1 ? '' : 's'} to downloads/${grab.folder}${extra}`, { label: 'Open folder', fn: () => reveal(grab.folder) });
+      } else {
+        throw new Error(grab.error || 'nothing saved');
+      }
     } catch (err) {
-      toast(ERRORS[err.message] || `Bypass failed (${err.message})`);
+      toast(ERRORS[err.message] || `Download failed: ${err.message}`);
     }
     t.disabled = false;
     t.textContent = lbl;
@@ -321,7 +362,7 @@ $('rows').onclick = async (e) => {
       btn.disabled = false;
       btn.className = 'gofile pending';
       btn.textContent = label;
-      toast(ERRORS[err.message] || `Bypass failed (${err.message}) — opened the locker`);
+      toast(ERRORS[err.message] || `Bypass failed: ${err.message} — opened the locker`);
     }
     return;
   }
@@ -352,7 +393,9 @@ document.addEventListener('keydown', (e) => {
 
 api('/api/schedule').then((s) => showSched(s));
 api('/api/key').then((k) => {
+  $('build').textContent = k.build || '?';
   if (!k.has_key) note('status', 'No premium key set — add bypass-key.txt next to server.js and it will pick it up on the next click.', 'warn');
+  else if (!k.key_clean) note('status', `Key looks odd (${k.key_length} chars, starts "${k.key_prefix}") — check bypass-key.txt has just the key.`, 'warn');
 }).catch(() => {});
 refreshSaved();
 </script>
