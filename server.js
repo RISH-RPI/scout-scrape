@@ -7,7 +7,7 @@ const { exec } = require('child_process');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 
-const BUILD = 'v8';
+const BUILD = 'v7';
 const SITE = 'https://scouted-today.pk';
 const PORT = process.env.PORT || 3000;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36';
@@ -15,8 +15,7 @@ const DATA = path.join(__dirname, 'data');
 const DOWNLOADS = path.join(__dirname, 'downloads');
 const SCHEDULE_FILE = path.join(__dirname, 'schedule.json');
 const CACHE_FILE = path.join(__dirname, 'bypass-cache.json');
-const KEY_FILE = path.join(__dirname, 'bypass-key.txt');       // bypass.vip premium key
-const FILESTER_KEY_FILE = path.join(__dirname, 'filester-key.txt'); // optional filester API key
+const KEY_FILE = path.join(__dirname, 'bypass-key.txt'); // bypass.vip premium key
 const MAX_FILES = 80;
 fs.mkdirSync(DATA, { recursive: true });
 fs.mkdirSync(DOWNLOADS, { recursive: true });
@@ -44,10 +43,6 @@ const keyInfo = () => {
     source: process.env.BYPASS_VIP_KEY ? 'env' : (fs.existsSync(KEY_FILE) ? 'file' : null),
   };
 };
-
-// Optional: lets the grabber fetch originals instead of thumbnails.
-const readFilmseterKey = () => String(process.env.FILESTER_API_KEY || (fs.existsSync(FILESTER_KEY_FILE) ? fs.readFileSync(FILESTER_KEY_FILE, 'utf8') : ''))
-  .replace(/^\uFEFF/, '').replace(/["'`\s]/g, '');
 
 // Hosts worth sending to the API. Anything else is already the real file.
 const LOCKERS = ['linkvertise.com','linkvertise.net','linkvertise.link','link-hub.net','link-hub.com','link-to.net','up-to-down.net','file-upload.net','lootlinks.com','loot-links.com','lootlink.org','lootlabs.gg','work.ink','workink.net','mboost.me','bst.gg','booo.st','rekonise.com','social-unlock.com','sub2unlock.com','sub2unlock.net','sub2get.com','sub4unlock.io','unlocknow.net','ytsubme.com','cuty.io','cety.io','boost.ink','adfoc.us','paster.so','paster.gg','mendationforc.info','socialwolvez.com','subfinal.com'];
@@ -199,7 +194,7 @@ async function scrapeDay(date) {
     const r = await fetch(url, { headers: { 'user-agent': UA } });
     if (!r.ok) throw new Error(`Site returned ${r.status}`);
     rows.push(...(await r.json()).map(toRow));
-    if (page >= Number(r.headers.get('x-totalpages') || r.headers.get('x-wp-totalpages') || 1)) break;
+    if (page >= Number(r.headers.get('x-wp-totalpages') || 1)) break;
   }
 
   // Redirect resolution only — free, and it points at the real locker.
@@ -210,9 +205,11 @@ async function scrapeDay(date) {
   return result;
 }
 
-// ---- names, extensions, zipping ----
+// ---- media grabbing ----
+// Strip anything awkward from a name we hand back to the OS.
 const safeName = (s) => String(s || '').replace(/[\\/:*?"<>|\x00-\x1f]+/g, '_').replace(/^[.\s_]+/, '').replace(/\s+/g, ' ').trim().slice(0, 100);
 
+// Content types we can turn into an extension, so a nameless URL never lands as .bin.
 const EXT_BY_TYPE = {
   'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp', 'image/avif': '.avif', 'image/svg+xml': '.svg',
   'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov', 'video/x-matroska': '.mkv',
@@ -221,106 +218,11 @@ const EXT_BY_TYPE = {
   'text/html': '.html', 'application/json': '.json',
 };
 
-// CRC32 for the zip entries.
-const CRC_TABLE = (() => { const t = new Int32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c; } return t; })();
-const crc32 = (buf) => { let c = -1; for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8); return (c ^ -1) >>> 0; };
-
-// Minimal store-only zip, so no dependency is needed. Names are UTF-8 flagged.
-function buildZip(entries) {
-  const local = [], central = [];
-  let offset = 0;
-  for (const e of entries) {
-    const name = Buffer.from(e.name, 'utf8');
-    const crc = crc32(e.buf);
-    const h = Buffer.alloc(30);
-    h.writeUInt32LE(0x04034b50, 0); h.writeUInt16LE(20, 4); h.writeUInt16LE(0x0800, 6);
-    h.writeUInt32LE(crc, 14); h.writeUInt32LE(e.buf.length, 18); h.writeUInt32LE(e.buf.length, 22);
-    h.writeUInt16LE(name.length, 26);
-    local.push(h, name, e.buf);
-
-    const c = Buffer.alloc(46);
-    c.writeUInt32LE(0x02014b50, 0); c.writeUInt16LE(20, 4); c.writeUInt16LE(20, 6); c.writeUInt16LE(0x0800, 8);
-    c.writeUInt32LE(crc, 16); c.writeUInt32LE(e.buf.length, 20); c.writeUInt32LE(e.buf.length, 24);
-    c.writeUInt16LE(name.length, 28); c.writeUInt32LE(offset, 42);
-    central.push(c, name);
-    offset += h.length + name.length + e.buf.length;
-  }
-  const cd = Buffer.concat(central);
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(entries.length, 8); eocd.writeUInt16LE(entries.length, 10);
-  eocd.writeUInt32LE(cd.length, 12); eocd.writeUInt32LE(offset, 16);
-  return Buffer.concat([...local, cd, eocd]);
-}
-
-// ---- filester.me ----
-// The album page lists every file's real name next to a /t/<uuid> thumbnail. The uuid is the file's
-// own id, so the account API can turn it into the real /d/<slug> download link.
-const FILESTER = /^https?:\/\/(?:www\.)?filester\.me\/f\/([A-Za-z0-9]+)/i;
-
-function filesterItems(html) {
-  const items = [];
-  for (const m of html.matchAll(/data-name="([^"]*)"[\s\S]{0,800}?\/t\/([0-9a-f-]{36})/gi)) items.push({ name: m[1].replace(/&amp;/g, '&'), uuid: m[2] });
-  return items;
-}
-
-// Resolve one uuid to a real download URL. Needs the filester API key.
-async function filesterOriginal(uuid, key) {
-  const r = await fetch(`https://u1.filester.me/api/v1/file/${uuid}`, {
-    headers: { authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': UA },
-    signal: AbortSignal.timeout(20_000),
-  });
-  const j = await r.json().catch(() => null);
-  return j?.success ? (j.data?.url || null) : null;
-}
-
-async function fetchBuffer(url, referer) {
-  const r = await fetch(url, { headers: { 'user-agent': UA, referer, accept: '*/*' }, redirect: 'follow', signal: AbortSignal.timeout(180_000) });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return Buffer.from(await r.arrayBuffer());
-}
-
-// Builds <title>.zip on disk from the album. Originals when a key is set, thumbnails otherwise.
-async function grabFilester(target, title, html) {
-  const m = FILESTER.exec(target);
-  if (!m) return null;
-  const items = filesterItems(html);
-  if (!items.length) return { error: 'no-items' };
-
-  const key = readFilmseterKey();
-  const entries = [], failed = [];
-  let originals = 0;
-
-  for (const [i, it] of items.entries()) {
-    const wantName = safeName(it.name) || `file-${i + 1}`;
-    try {
-      let url = key ? await filesterOriginal(it.uuid, key) : null;
-      if (url) originals++;
-      else url = `https://filester.me/t/${it.uuid}`;
-      const buf = await fetchBuffer(url, target);
-      if (!buf.length) throw new Error('empty');
-      const ext = path.extname(wantName);
-      const name = ext ? wantName : wantName + '.jpg';
-      entries.push({ name, buf });
-    } catch (e) {
-      failed.push({ file: wantName, error: e.message });
-    }
-  }
-  if (!entries.length) return { error: 'nothing fetched', failed };
-
-  const zipName = `${safeName(title) || m[1]}.zip`;
-  let out = path.join(DOWNLOADS, zipName);
-  for (let n = 2; fs.existsSync(out); n++) out = path.join(DOWNLOADS, `${path.basename(zipName, '.zip')} (${n}).zip`);
-  fs.writeFileSync(out, buildZip(entries));
-
-  console.log(`[grab] ${path.basename(out)}: ${entries.length} files (${originals} originals), ${failed.length} failed`);
-  return { file: path.basename(out), url: '/api/zip?name=' + encodeURIComponent(path.basename(out)), count: entries.length, originals, failed };
-}
-
-// ---- generic page scraping (non-filester hosts) ----
 const MEDIA_EXT = /\.(jpe?g|png|gif|webp|avif|bmp|svg|mp4|webm|mov|m4v|mkv|mp3|m4a|wav|ogg|pdf|zip|rar|7z)$/i;
 const abs = (u, base) => { try { return new URL(u, base).href; } catch { return null; } };
 
+// Everything on the page that looks like a real asset: og/twitter tags, media tags with all their
+// lazy-load attributes, srcsets, and single-page download routes like /d/<slug>.
 function extractMedia(html, pageUrl) {
   const out = new Set();
   const push = (raw) => {
@@ -328,7 +230,9 @@ function extractMedia(html, pageUrl) {
     const a = abs(String(raw).replace(/&amp;/g, '&').trim(), pageUrl);
     if (a && /^https?:/i.test(a)) out.add(a);
   };
+
   for (const m of html.matchAll(/<meta[^>]+(?:property|name)=["'](?:og:image(?::secure_url|:url)?|og:video(?::url)?|og:audio|twitter:image)["'][^>]*content=["']([^"']+)["']/gi)) push(m[1]);
+
   for (const m of html.matchAll(/<(?:img|source|video|audio|picture)\b[^>]*>/gi)) {
     const tag = m[0];
     for (const attr of ['src', 'data-src', 'data-original', 'data-full', 'data-image', 'data-video', 'poster']) {
@@ -338,11 +242,19 @@ function extractMedia(html, pageUrl) {
     const ss = /\bsrcset=["']([^"']+)["']/i.exec(tag);
     if (ss) for (const part of ss[1].split(',')) push(part.trim().split(/\s+/)[0]);
   }
+
   for (const m of html.matchAll(/<a\b[^>]*href=["']([^"']+)["']/gi)) push(m[1]);
   for (const m of html.matchAll(/location\.href\s*=\s*["']([^"']+)["']/gi)) push(m[1]);
-  return [...out].filter((u) => { try { const p = new URL(u).pathname; return MEDIA_EXT.test(p) || /^\/d\/[A-Za-z0-9_-]+$/.test(p); } catch { return false; } });
+
+  return [...out].filter((u) => {
+    try {
+      const p = new URL(u).pathname;
+      return MEDIA_EXT.test(p) || /^\/d\/[A-Za-z0-9_-]+$/.test(p);
+    } catch { return false; }
+  });
 }
 
+// A fresh folder under downloads/, named after the post. Never overwrites an existing one.
 function folderFor(title) {
   const base = safeName(title) || 'untitled';
   let dir = path.join(DOWNLOADS, base);
@@ -352,22 +264,32 @@ function folderFor(title) {
 }
 
 async function saveOne(url, dir, pageUrl, index) {
-  const r = await fetch(url, { headers: { 'user-agent': UA, referer: pageUrl, accept: '*/*' }, redirect: 'follow', signal: AbortSignal.timeout(90_000) });
+  const r = await fetch(url, {
+    headers: { 'user-agent': UA, referer: pageUrl, accept: '*/*' },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(90_000),
+  });
   if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+
   const type = (r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
   const cd = r.headers.get('content-disposition') || '';
+
+  // Name from the header, else the final URL, and an extension from the type when the name lacks one.
   let name = safeName((/filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd) || [])[1]);
   if (!name) { try { name = safeName(decodeURIComponent(new URL(r.url || url).pathname.split('/').filter(Boolean).pop() || '')); } catch {} }
   if (!name) name = `file-${index}`;
   if (!/\.[a-z0-9]{2,5}$/i.test(name)) name += EXT_BY_TYPE[type] || '.bin';
+
   const ext = path.extname(name), stem = path.basename(name, ext);
   let dest = path.join(dir, name);
   for (let n = 2; fs.existsSync(dest); n++) dest = path.join(dir, `${stem} (${n})${ext}`);
+
   await pipeline(Readable.fromWeb(r.body), fs.createWriteStream(dest));
   if (!fs.statSync(dest).size) { fs.unlinkSync(dest); throw new Error('empty'); }
   return path.basename(dest);
 }
 
+// Small pool so a gallery of fifty files does not open fifty sockets at once.
 async function saveAll(urls, dir, pageUrl) {
   const saved = [], failed = [];
   let i = 0;
@@ -379,6 +301,59 @@ async function saveAll(urls, dir, pageUrl) {
     }
   }));
   return { saved, failed };
+}
+
+// ---- filester.me ----
+// Their album page has a real "download folder" endpoint that returns a zip. Far better than
+// scraping the page, whose <img> tags are only thumbnails.
+const FILESTER = /^https?:\/\/(?:www\.)?filester\.me\/f\/([A-Za-z0-9]+)/i;
+
+async function filesterZip(target, title) {
+  const m = FILESTER.exec(target);
+  if (!m) return null;
+  const id = m[1];
+  const attempts = [];
+
+  // Prime a session first, so the POST carries whatever cookies the site hands out.
+  let cookie = '';
+  try {
+    const p = await fetch(target, { headers: { 'user-agent': UA, accept: 'text/html' }, signal: AbortSignal.timeout(20_000) });
+    await p.text().catch(() => {});
+    const list = typeof p.headers.getSetCookie === 'function' ? p.headers.getSetCookie() : [];
+    cookie = list.map((c) => c.split(';')[0]).join('; ');
+  } catch {}
+
+  const base = {
+    'user-agent': UA,
+    origin: 'https://filester.me',
+    referer: target,
+    accept: 'application/json, text/plain, */*',
+    'x-requested-with': 'XMLHttpRequest',
+    ...(cookie ? { cookie } : {}),
+  };
+
+  // Their own button sends JSON; form encoding is the fallback.
+  const variants = [
+    { name: 'json', headers: { ...base, 'content-type': 'application/json' }, body: JSON.stringify({ identifier: id }) },
+    { name: 'form', headers: { ...base, 'content-type': 'application/x-www-form-urlencoded' }, body: `identifier=${encodeURIComponent(id)}` },
+  ];
+
+  for (const v of variants) {
+    try {
+      const r = await fetch('https://filester.me/api/folder/download', { method: 'POST', headers: v.headers, body: v.body, signal: AbortSignal.timeout(30_000) });
+      const raw = await r.text();
+      attempts.push({ variant: v.name, status: r.status, body: raw.slice(0, 400) });
+      console.log(`[grab] filester ${v.name}:`, r.status, raw.replace(/\s+/g, ' ').slice(0, 200));
+      let j = null;
+      try { j = JSON.parse(raw); } catch {}
+      const url = j?.data?.download_url;
+      if (j?.success && url) return { zip: url, name: `${safeName(title) || id}.zip`, attempts };
+    } catch (e) {
+      attempts.push({ variant: v.name, error: e.message });
+      console.log(`[grab] filester ${v.name} failed:`, e.message);
+    }
+  }
+  return { error: 'folder API failed', attempts };
 }
 
 // ---- auto-run ----
@@ -430,11 +405,15 @@ const server = http.createServer(async (req, res) => {
       const { result, error } = await bypassLink(target, { refresh: u.searchParams.has('refresh') });
       return send(res, 200, { url: target, result, error, build: BUILD });
     }
-    // Collects the destination page and packages it.
+    // Works out how to get everything off the destination page.
     if (u.pathname === '/api/grab') {
       const target = (u.searchParams.get('url') || '').trim();
       const title = u.searchParams.get('title') || '';
       if (!isUrl(target)) return send(res, 400, { error: 'url must be http(s)' });
+
+      // A host with a real folder endpoint: hand back a zip instead of thumbnails.
+      const z = await filesterZip(target, title);
+      if (z?.zip) return send(res, 200, { zip: z.zip, name: z.name, saved: [], failed: [], found: 0 });
 
       let page;
       try {
@@ -443,33 +422,22 @@ const server = http.createServer(async (req, res) => {
         return send(res, 502, { error: 'page fetch failed: ' + (e.name === 'TimeoutError' ? 'timed out' : e.message) });
       }
       if (!page.ok) return send(res, 502, { error: `page HTTP ${page.status}` });
+
       const html = await page.text();
-
-      // Album hosts get a real zip.
-      const z = await grabFilester(page.url || target, title, html);
-      if (z?.url) return send(res, 200, { zip: z.url, name: z.file, saved: [], failed: z.failed, found: z.count, originals: z.originals });
-
-      // Anything else: save what the page references into a folder.
       const media = extractMedia(html, page.url || target).slice(0, MAX_FILES);
-      if (!media.length) return send(res, 200, { folder: null, saved: [], failed: [], found: 0, error: z?.error ? `no-media (${z.error})` : 'no-media' });
+      if (!media.length) return send(res, 200, { folder: null, saved: [], failed: [], found: 0, error: z?.error ? `no-media (${z.error})` : 'no-media', attempts: z?.attempts || [] });
+
       const dir = folderFor(title);
       const { saved, failed } = await saveAll(media, dir, page.url || target);
       if (!saved.length) { try { fs.rmdirSync(dir); } catch {} }
       console.log(`[grab] ${path.basename(dir)}: ${saved.length} saved, ${failed.length} failed of ${media.length}`);
-      return send(res, 200, { folder: saved.length ? path.basename(dir) : null, saved, failed, found: media.length });
+      return send(res, 200, { folder: saved.length ? path.basename(dir) : null, saved, failed, found: media.length, attempts: z?.attempts || [] });
     }
-    // Serves a built zip.
-    if (u.pathname === '/api/zip') {
-      const name = path.basename(u.searchParams.get('name') || '');
-      const file = path.join(DOWNLOADS, name);
-      if (!name || !fs.existsSync(file)) return send(res, 404, { error: 'no such zip' });
-      res.writeHead(200, {
-        'content-type': 'application/zip',
-        'content-disposition': `attachment; filename="${name.replace(/[^\x20-\x7e]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`,
-        'content-length': fs.statSync(file).size,
-        'cache-control': 'no-store',
-      });
-      return fs.createReadStream(file).pipe(res);
+    // Diagnostics for the folder-zip route only.
+    if (u.pathname === '/api/grab/debug') {
+      const target = (u.searchParams.get('url') || '').trim();
+      if (!isUrl(target)) return send(res, 400, { error: 'url must be http(s)' });
+      return send(res, 200, { build: BUILD, result: await filesterZip(target, 'debug') });
     }
     // Opens a downloads folder in the file manager.
     if (u.pathname === '/api/reveal') {
@@ -478,18 +446,6 @@ const server = http.createServer(async (req, res) => {
       if (!fs.existsSync(dir)) return send(res, 404, { error: 'no such folder' });
       exec(process.platform === 'win32' ? `explorer "${dir}"` : `open "${dir}"`);
       return send(res, 200, { ok: true, path: dir });
-    }
-    if (u.pathname === '/api/grab/debug') {
-      const target = (u.searchParams.get('url') || '').trim();
-      if (!isUrl(target)) return send(res, 400, { error: 'url must be http(s)' });
-      const page = await fetch(target, { headers: { 'user-agent': UA, accept: 'text/html' }, redirect: 'follow', signal: AbortSignal.timeout(30_000) }).catch((e) => ({ ok: false, status: 0, text: async () => e.message }));
-      const html = await page.text();
-      const items = filesterItems(html);
-      const key = readFilmseterKey();
-      const probe = items.slice(0, 2);
-      const resolved = [];
-      for (const p of probe) resolved.push({ uuid: p.uuid, name: p.name, url: key ? await filesterOriginal(p.uuid, key) : null });
-      return send(res, 200, { build: BUILD, has_filester_key: !!key, items: items.length, sample: resolved });
     }
     // Diagnostics: key shape, and the raw upstream answers for both URL forms.
     if (u.pathname === '/api/bypass/debug') {
@@ -516,7 +472,7 @@ const server = http.createServer(async (req, res) => {
       if (isOwnPage(target)) return send(res, 400, { error: 'that is bypass.vip, not a file' });
       return sendDownload(res, target, name ? safeName(name) : null);
     }
-    if (u.pathname === '/api/key') return send(res, 200, { ...keyInfo(), build: BUILD, has_filester_key: !!readFilmseterKey() });
+    if (u.pathname === '/api/key') return send(res, 200, { ...keyInfo(), build: BUILD });
     if (u.pathname === '/api/saved') {
       const d = u.searchParams.get('date');
       if (isDate(d)) {
@@ -585,6 +541,6 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`Scout scraper ${BUILD} running at ${APP_URL}  (close this window to stop it)`);
   const k = keyInfo();
   console.log(k.has_key ? `[bypass] key loaded: ${k.key_length} chars, starts ${k.key_prefix}${k.key_clean ? '' : ' (WARNING: unexpected characters)'}` : '[bypass] NO premium key — drop one in bypass-key.txt');
-  console.log(readFilmseterKey() ? '[grab] filester key loaded — albums will zip at full size' : '[grab] no filester key — albums will zip thumbnails only (add filester-key.txt)');
+  console.log(`[bypass] cache: ${Object.keys(cache).length} usable entr${Object.keys(cache).length === 1 ? 'y' : 'ies'}${purged ? `, ${purged} stale dropped` : ''}`);
   openBrowser();
 });
